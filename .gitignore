@@ -1,0 +1,16 @@
+# Dependencias
+node_modules/
+.expo/
+
+# Variables de entorno (secretos)
+.env
+.env.local
+
+# Archivos de compilación y logs
+dist/
+build/
+*.log
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
