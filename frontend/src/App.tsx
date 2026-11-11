@@ -13,6 +13,9 @@ type TablaVista = {
 
 type CandidatoLista = { tabla: string; columna: string; ejemplo: string };
 
+// Dependencia detectada en los datos que todavía hay que declarar o descartar
+type Pendiente = { fase: '2FN' | '3FN'; tabla: string; determinante: string[]; dependientes: string[] };
+
 type Paso = {
     id: string;
     titulo: string;
@@ -22,6 +25,7 @@ type Paso = {
     requisitos?: Requisito[];
     tablas?: TablaVista[];
     candidatos?: CandidatoLista[];
+    pendientes?: Pendiente[];
     svg?: string;
 };
 
@@ -38,6 +42,12 @@ type Resultado = {
 
 // Lo que escribe el usuario en el formulario de dependencias (las listas se escriben como texto)
 type FilaDependencia = { tabla: string; determinante: string; dependientes: string; nombreTabla: string };
+
+// Dependencia parcial (2FN): la clave parcial se escribe separada por comas
+type FilaParcial = { tabla: string; clave: string; dependientes: string; nombreTabla: string };
+
+// Dependencia detectada que el usuario descartó
+type Descarte = { fase: '2FN' | '3FN'; tabla: string; determinante: string[]; dependientes: string[] };
 
 const API = 'http://localhost:3001/api';
 
@@ -79,28 +89,40 @@ function App() {
     const [cargando, setCargando] = useState(false);
     const [confirmado, setConfirmado] = useState(false);
     const [dependencias, setDependencias] = useState<FilaDependencia[]>([]);
+    const [parciales, setParciales] = useState<FilaParcial[]>([]);
+    const [descartes, setDescartes] = useState<Descarte[]>([]);
     const [listas, setListas] = useState<Record<string, boolean>>({});
 
-    const procesar = async (confirmarOverride?: boolean) => {
+    const procesar = async (confirmarOverride?: boolean, descartesOverride?: Descarte[]) => {
         if (!archivo) return;
         const confirmar = confirmarOverride ?? confirmado;
         setCargando(true);
         setError(null);
 
+        const separar = (texto: string) => texto.split(',').map(s => s.trim()).filter(Boolean);
         const decisiones = {
             prerrequisitosConfirmados: confirmar,
-            listas: Object.entries(listas).map(([clave, separar]) => {
+            listas: Object.entries(listas).map(([clave, separarLista]) => {
                 const [tabla, ...resto] = clave.split('.');
-                return { tabla: tabla ?? '', columna: resto.join('.'), separar };
+                return { tabla: tabla ?? '', columna: resto.join('.'), separar: separarLista };
             }),
+            dependenciasParciales: parciales
+                .filter(p => p.tabla.trim() && p.clave.trim())
+                .map(p => ({
+                    tabla: p.tabla.trim(),
+                    clave: separar(p.clave),
+                    dependientes: separar(p.dependientes),
+                    nombreTabla: p.nombreTabla.trim(),
+                })),
             dependencias: dependencias
                 .filter(d => d.tabla.trim() && d.determinante.trim())
                 .map(d => ({
                     tabla: d.tabla.trim(),
                     determinante: d.determinante.trim(),
-                    dependientes: d.dependientes.split(',').map(s => s.trim()).filter(Boolean),
+                    dependientes: separar(d.dependientes),
                     nombreTabla: d.nombreTabla.trim(),
                 })),
+            descartadas: descartesOverride ?? descartes,
         };
 
         const formData = new FormData();
@@ -130,6 +152,8 @@ function App() {
         setConfirmado(false);
         setListas({});
         setDependencias([]);
+        setParciales([]);
+        setDescartes([]);
         if (nuevo && !nuevo.name.toLowerCase().endsWith('.sql')) {
             setArchivo(null);
             setError('Solo se aceptan archivos .sql');
@@ -154,6 +178,35 @@ function App() {
 
     const cambiarDependencia = (indice: number, campo: keyof FilaDependencia, valor: string) => {
         setDependencias(prev => prev.map((d, i) => (i === indice ? { ...d, [campo]: valor } : d)));
+    };
+
+    const cambiarParcial = (indice: number, campo: keyof FilaParcial, valor: string) => {
+        setParciales(prev => prev.map((p, i) => (i === indice ? { ...p, [campo]: valor } : p)));
+    };
+
+    // Pasa una dependencia detectada al formulario correspondiente para completarla
+    const declarar = (pendiente: Pendiente) => {
+        if (pendiente.fase === '2FN') {
+            setParciales(prev => [...prev, {
+                tabla: pendiente.tabla, clave: pendiente.determinante.join(', '),
+                dependientes: pendiente.dependientes.join(', '), nombreTabla: '',
+            }]);
+        } else {
+            setDependencias(prev => [...prev, {
+                tabla: pendiente.tabla, determinante: pendiente.determinante[0] ?? '',
+                dependientes: pendiente.dependientes.join(', '), nombreTabla: '',
+            }]);
+        }
+    };
+
+    // Descartar vuelve a procesar el archivo con esa dependencia marcada como descartada
+    const descartar = (pendiente: Pendiente) => {
+        const nuevos: Descarte[] = [...descartes, {
+            fase: pendiente.fase, tabla: pendiente.tabla,
+            determinante: pendiente.determinante, dependientes: pendiente.dependientes,
+        }];
+        setDescartes(nuevos);
+        procesar(undefined, nuevos);
     };
 
     const pasoPrerrequisitos = resultado?.pasos?.find(p => p.id === 'prerrequisitos');
@@ -236,8 +289,24 @@ function App() {
                                 </div>
                             )}
 
-                            {paso.detalles.length > 0 && paso.id !== 'prerrequisitos' && (
+                            {paso.detalles.length > 0 && paso.id !== 'prerrequisitos' && !(paso.pendientes && paso.pendientes.length > 0) && (
                                 <ul>{paso.detalles.map((d, i) => <li key={i}>{d}</li>)}</ul>
+                            )}
+
+                            {paso.pendientes && paso.pendientes.length > 0 && (
+                                <div style={{ marginTop: 8, padding: 8, background: '#fff7ed', borderRadius: 6 }}>
+                                    <strong>Dependencias detectadas en los datos</strong>
+                                    <div style={{ color: '#555', marginBottom: 6 }}>
+                                        Con pocas filas, algunas pueden ser accidentales. Declara solo las que sean reales y descarta el resto.
+                                    </div>
+                                    {paso.pendientes.map((p, i) => (
+                                        <div key={i} style={{ marginBottom: 4 }}>
+                                            <code>{p.tabla}</code>: {p.determinante.join(', ')} → {p.dependientes.join(', ')}{' '}
+                                            <button onClick={() => declarar(p)} disabled={cargando}>Declarar</button>{' '}
+                                            <button onClick={() => descartar(p)} disabled={cargando}>Descartar</button>
+                                        </div>
+                                    ))}
+                                </div>
                             )}
 
                             {paso.candidatos && paso.candidatos.length > 0 && (
@@ -317,6 +386,32 @@ function App() {
                             )}
                         </section>
                     ))}
+
+                    <section style={{ border: '1px solid #ccc', borderRadius: 8, padding: '1rem', marginBottom: '1rem' }}>
+                        <h3 style={{ marginTop: 0 }}>Dependencias parciales (2FN)</h3>
+                        <p style={{ marginTop: 0, color: '#555' }}>
+                            Declara qué parte de la clave primaria determina otras columnas. Ejemplo: si la clave es
+                            <code> Cod_Actividad, Fecha, Hora_I, Sala</code> y <code>Cod_Actividad</code> determina
+                            <code> Nombre_Actividad</code>, esa columna pasa a su propia tabla. Si tu archivo no tiene dependencias de este tipo, deja esta sección vacía.
+                        </p>
+                        {parciales.map((p, i) => (
+                            <div key={i} style={{ marginBottom: 4 }}>
+                                <input style={estiloCampo} placeholder="Tabla" value={p.tabla} onChange={e => cambiarParcial(i, 'tabla', e.target.value)} />
+                                <input style={estiloCampo} placeholder="Clave parcial (separada por coma)" value={p.clave} onChange={e => cambiarParcial(i, 'clave', e.target.value)} />
+                                <input style={{ ...estiloCampo, width: 220 }} placeholder="Dependientes (separados por coma)" value={p.dependientes} onChange={e => cambiarParcial(i, 'dependientes', e.target.value)} />
+                                <input style={estiloCampo} placeholder="Nueva tabla" value={p.nombreTabla} onChange={e => cambiarParcial(i, 'nombreTabla', e.target.value)} />
+                                <button onClick={() => setParciales(prev => prev.filter((_, idx) => idx !== i))}>Quitar</button>
+                            </div>
+                        ))}
+                        <button onClick={() => setParciales(prev => [...prev, { tabla: '', clave: '', dependientes: '', nombreTabla: '' }])}>
+                            + Agregar dependencia parcial
+                        </button>
+                        <div style={{ marginTop: 12 }}>
+                            <button onClick={() => { setConfirmado(true); procesar(true); }} disabled={!archivo || cargando}>
+                                {cargando ? 'Procesando…' : 'Normalizar con estas decisiones'}
+                            </button>
+                        </div>
+                    </section>
 
                     <section style={{ border: '1px solid #ccc', borderRadius: 8, padding: '1rem', marginBottom: '1rem' }}>
                         <h3 style={{ marginTop: 0 }}>Dependencias transitivas (3FN)</h3>

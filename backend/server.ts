@@ -39,9 +39,20 @@ type DependenciaDeclarada = { tabla: string; determinante: string; dependientes:
 
 type ListaDecidida = { tabla: string; columna: string; separar: boolean };
 
+// Dependencia parcial (2FN): una parte de la clave determina columnas no primas
+type DependenciaParcialDeclarada = { tabla: string; clave: string[]; dependientes: string[]; nombreTabla: string };
+
+// Dependencia detectada en los datos que el usuario descartó
+type Descarte = { fase: '2FN' | '3FN'; tabla: string; determinante: string[]; dependientes: string[] };
+
+// Dependencia detectada que todavía hay que declarar o descartar
+type Pendiente = { fase: '2FN' | '3FN'; tabla: string; determinante: string[]; dependientes: string[] };
+
 type Decisiones = {
     prerrequisitosConfirmados?: boolean;
     dependencias?: DependenciaDeclarada[];
+    dependenciasParciales?: DependenciaParcialDeclarada[];
+    descartadas?: Descarte[];
     listas?: ListaDecidida[];
 };
 
@@ -60,6 +71,7 @@ type Paso = {
     detalles: string[];
     requisitos?: Requisito[];
     candidatos?: CandidatoLista[];
+    pendientes?: Pendiente[];
     tablas?: VistaTabla[];
     svg?: string;
 };
@@ -515,7 +527,41 @@ function separarListas(modelo: Modelo, objetivos: { tabla: string; columna: stri
         const tienePK = tabla.pk.length > 0;
         if (tienePK) {
             if (nuevas.some(f => f[i] === null)) {
-                detalles.push(`${tabla.nombre}.${columna.nombre}: tiene listas y también valores NULL; no se amplió la clave. Revisa esa columna.`);
+                // Con valores NULL la columna no puede formar parte de la clave: los valores pasan a una tabla propia
+                const nombre = nombreLibre(modelo, `${tabla.nombre}_${columna.nombre}`);
+                const indicesClave = tabla.pk.map(p => tabla.columnas.findIndex(c => c.nombre === p));
+                const nuevaTabla: Tabla = {
+                    nombre,
+                    columnas: [
+                        ...tabla.pk.map(p => ({ ...tabla.columnas.find(c => c.nombre === p)!, nullable: false })),
+                        { ...columna, nullable: false },
+                    ],
+                    pk: [...tabla.pk, columna.nombre],
+                    filas: [],
+                };
+                const vistos = new Set<string>();
+                for (const fila of tabla.filas) {
+                    const valoresClave = indicesClave.map(k => fila[k] ?? null);
+                    const valor = fila[i];
+                    const piezas = typeof valor === 'string' ? separarValores(valor) : [];
+                    for (const pieza of piezas) {
+                        const llave = JSON.stringify([...valoresClave, pieza]);
+                        if (!vistos.has(llave)) {
+                            vistos.add(llave);
+                            nuevaTabla.filas.push([...valoresClave, pieza]);
+                        }
+                    }
+                }
+                modelo.tablas[nombre] = nuevaTabla;
+                tabla.columnas = tabla.columnas.filter(c => c.nombre !== columna.nombre);
+                tabla.filas = tabla.filas.map(f => f.filter((_, k) => k !== i));
+                for (const p of tabla.pk) {
+                    modelo.fks.push({
+                        tablaHija: nombre, columnaHija: p, tablaPadre: tabla.nombre, columnaPadre: p,
+                        onUpdate: 'CASCADE', onDelete: 'CASCADE',
+                    });
+                }
+                detalles.push(`${tabla.nombre}.${columna.nombre}: los valores pasaron a ${nombre} (clave ${nuevaTabla.pk.join(', ')}, ${nuevaTabla.filas.length} fila(s)). Las filas sin valor no generan registros.`);
                 continue;
             }
             const indicesClave = [...tabla.pk.map(p => tabla.columnas.findIndex(c => c.nombre === p)), i];
@@ -586,6 +632,40 @@ function buscarDependenciasParciales(modelo: Modelo): { tabla: string; clave: st
     return resultado;
 }
 
+const mismoConjunto = (a: string[], b: string[]) =>
+    a.length === b.length && a.every(x => b.includes(x));
+
+// Un descarte coincide con una dependencia detectada por fase, tabla y determinante (sin importar el orden)
+function estaDescartada(descartes: Descarte[], fase: '2FN' | '3FN', tabla: string, determinante: string[]): boolean {
+    return descartes.some(d => d.fase === fase && d.tabla === tabla && mismoConjunto(d.determinante, determinante));
+}
+
+// Verifica una dependencia parcial declarada contra los datos antes de separarla
+function validarDependenciaParcial(tabla: Tabla, clave: string[], columnas: string[]): string | null {
+    if (!clave.length) return `Indica la clave parcial de ${tabla.nombre}`;
+    if (!clave.every(c => tabla.pk.includes(c)) || clave.length >= tabla.pk.length) {
+        return `${clave.join(', ')} no es una parte propia de la clave primaria de ${tabla.nombre} (${tabla.pk.join(', ')})`;
+    }
+    if (!columnas.length) return `Indica qué columnas dependen de ${clave.join(', ')}`;
+    const iClave = clave.map(c => tabla.columnas.findIndex(x => x.nombre === c));
+    for (const columna of columnas) {
+        const iCol = tabla.columnas.findIndex(x => x.nombre === columna);
+        if (iCol < 0) return `No existe la columna ${columna} en ${tabla.nombre}`;
+        if (tabla.pk.includes(columna)) return `${columna} es clave primaria: no puede ser dependiente`;
+        const valores = new Map<string, string>();
+        for (const fila of tabla.filas) {
+            const llave = JSON.stringify(iClave.map(i => fila[i] ?? null));
+            const valor = JSON.stringify(fila[iCol] ?? null);
+            const previo = valores.get(llave);
+            if (previo !== undefined && previo !== valor) {
+                return `${clave.join(', ')}=${llave} tiene valores distintos en ${columna}: no es una dependencia`;
+            }
+            valores.set(llave, valor);
+        }
+    }
+    return null;
+}
+
 // Busca otra tabla con esa misma clave que ya guarde los mismos datos. Si existe, no hace falta crear una nueva
 function buscarTablaExistente(modelo: Modelo, tabla: Tabla, dep: { clave: string[]; columnas: string[] }): Tabla | null {
     if (tabla.filas.length === 0) return null;
@@ -613,7 +693,7 @@ function buscarTablaExistente(modelo: Modelo, tabla: Tabla, dep: { clave: string
     return null;
 }
 
-function aplicarSegundaFN(modelo: Modelo, dependencias: { tabla: string; clave: string[]; columnas: string[] }[]): string[] {
+function aplicarSegundaFN(modelo: Modelo, dependencias: { tabla: string; clave: string[]; columnas: string[]; nombreTabla?: string }[]): string[] {
     const detalles: string[] = [];
     for (const dep of dependencias) {
         const tabla = modelo.tablas[dep.tabla]!;
@@ -639,8 +719,9 @@ function aplicarSegundaFN(modelo: Modelo, dependencias: { tabla: string; clave: 
             continue;
         }
 
+        const nombreNuevo = dep.nombreTabla?.trim() ? dep.nombreTabla.trim() : `${tabla.nombre}_${dep.clave.join('_')}`;
         const nuevaTabla: Tabla = {
-            nombre: nombreLibre(modelo, `${tabla.nombre}_${dep.clave.join('_')}`),
+            nombre: nombreLibre(modelo, nombreNuevo),
             columnas: [
                 ...dep.clave.map(c => ({ ...tabla.columnas.find(x => x.nombre === c)!, nullable: false })),
                 ...dep.columnas.map(c => ({ ...tabla.columnas.find(x => x.nombre === c)! })),
@@ -718,11 +799,23 @@ function buscarDependenciasTransitivas(modelo: Modelo): { tabla: string; determi
     return resultado;
 }
 
+// Si una separación anterior ya movió la columna determinante, busca la tabla nueva donde quedó
+function tablaConColumna(modelo: Modelo, tabla: Tabla, columna: string, creadas: string[]): Tabla {
+    if (tabla.columnas.some(c => c.nombre === columna)) return tabla;
+    for (const nombre of [...creadas].reverse()) {
+        const candidata = modelo.tablas[nombre];
+        if (candidata && candidata.columnas.some(c => c.nombre === columna)) return candidata;
+    }
+    return tabla;
+}
+
 function aplicarTerceraFN(modelo: Modelo, declaradas: DependenciaDeclarada[]): string[] {
     const detalles: string[] = [];
+    const creadas: string[] = [];
     for (const dep of declaradas) {
-        const tabla = modelo.tablas[dep.tabla];
-        if (!tabla) throw new Error(`No existe la tabla ${dep.tabla}. Tablas en el archivo: ${Object.keys(modelo.tablas).join(', ')}`);
+        const tablaDeclarada = modelo.tablas[dep.tabla];
+        if (!tablaDeclarada) throw new Error(`No existe la tabla ${dep.tabla}. Tablas en el archivo: ${Object.keys(modelo.tablas).join(', ')}`);
+        const tabla = tablaConColumna(modelo, tablaDeclarada, dep.determinante, creadas);
         const columnaDeterminante = tabla.columnas.find(c => c.nombre === dep.determinante);
         if (!columnaDeterminante) throw new Error(`No existe la columna ${dep.determinante} en ${tabla.nombre}`);
         if (tabla.pk.includes(dep.determinante)) throw new Error(`${dep.determinante} es clave primaria: no puede ser determinante`);
@@ -778,6 +871,7 @@ function aplicarTerceraFN(modelo: Modelo, declaradas: DependenciaDeclarada[]): s
         }
 
         modelo.tablas[nuevaTabla.nombre] = nuevaTabla;
+        creadas.push(nuevaTabla.nombre);
         tabla.columnas = tabla.columnas.filter(c => !dep.dependientes.includes(c.nombre));
         tabla.filas = tabla.filas.map(f => f.filter((_, i) => !indicesDependientes.includes(i)));
         modelo.fks.push({
@@ -889,13 +983,43 @@ function ejecutarPipeline(original: Modelo, avisos: string[], decisiones: Decisi
     // 2FN
     let estado2: Estado = 'bloqueado';
     let detalles2: string[] = [];
+    let pendientes2: Pendiente[] = [];
     if (aprobado(estado1)) {
-        const parciales = buscarDependenciasParciales(modelo);
-        if (parciales.length) {
-            detalles2 = aplicarSegundaFN(modelo, parciales);
-            estado2 = 'transformado';
+        // 2FN se define sobre la clave principal: sin PRIMARY KEY declarada no hay nada que verificar
+        const sinClave = Object.values(modelo.tablas).filter(t => t.pk.length === 0).map(t => t.nombre);
+        if (sinClave.length) {
+            estado2 = 'no cumple';
+            detalles2 = sinClave.map(n =>
+                `${n}: no declara clave primaria. La 2FN se verifica contra la clave principal; agrega PRIMARY KEY al script.`);
         } else {
-            estado2 = 'cumple';
+            // Lo que detecta el análisis de datos es solo una sugerencia: se separa únicamente lo que el usuario declara
+            const declaradas = decisiones.dependenciasParciales ?? [];
+            const descartes = decisiones.descartadas ?? [];
+            const detectadas = buscarDependenciasParciales(modelo);
+            const sinCubrir = detectadas.filter(d =>
+                !estaDescartada(descartes, '2FN', d.tabla, d.clave) &&
+                !declaradas.some(x => x.tabla === d.tabla && mismoConjunto(x.clave, d.clave)));
+            if (sinCubrir.length) {
+                estado2 = 'revisar';
+                pendientes2 = sinCubrir.map(d => ({ fase: '2FN' as const, tabla: d.tabla, determinante: d.clave, dependientes: d.columnas }));
+                detalles2 = pendientes2.map(p =>
+                    `${p.tabla}: ${p.determinante.join(', ')} → ${p.dependientes.join(', ')} (detectada en los datos). Declárala para separarla o descártala.`);
+            } else {
+                try {
+                    const dependencias = declaradas.map(d => {
+                        const tabla = modelo.tablas[d.tabla];
+                        if (!tabla) throw new Error(`No existe la tabla ${d.tabla}. Tablas en el archivo: ${Object.keys(modelo.tablas).join(', ')}`);
+                        const error = validarDependenciaParcial(tabla, d.clave, d.dependientes);
+                        if (error) throw new Error(error);
+                        return { tabla: d.tabla, clave: d.clave, columnas: d.dependientes, nombreTabla: d.nombreTabla };
+                    });
+                    detalles2 = aplicarSegundaFN(modelo, dependencias);
+                    estado2 = detalles2.length ? 'transformado' : 'cumple';
+                } catch (e) {
+                    estado2 = 'no cumple';
+                    detalles2 = [e instanceof Error ? e.message : String(e)];
+                }
+            }
         }
     }
     pasos.push({
@@ -903,10 +1027,13 @@ function ejecutarPipeline(original: Modelo, avisos: string[], decisiones: Decisi
         titulo: 'Segunda forma normal (2FN)',
         estado: estado2,
         detalles: detalles2,
+        pendientes: pendientes2,
         ...vistaDeTablas(modelo),
         mensaje: mensajesPaso({
             cumple: 'Ya cumple 2FN: ningún atributo no primo depende solo de una parte de la clave.',
-            transformado: 'Se separaron las dependencias parciales en tablas propias.',
+            transformado: 'Se separaron las dependencias parciales declaradas en tablas propias.',
+            revisar: 'Hay dependencias parciales detectadas en los datos que debes declarar o descartar.',
+            'no cumple': 'No se puede verificar 2FN: falta la clave primaria en una o más tablas, o una dependencia declarada no es válida.',
             bloqueado: 'Pendiente: requiere 1FN aprobada.',
         }, estado2),
     });
@@ -914,15 +1041,19 @@ function ejecutarPipeline(original: Modelo, avisos: string[], decisiones: Decisi
     // 3FN
     let estado3: Estado = 'bloqueado';
     let detalles3: string[] = [];
+    let pendientes3: Pendiente[] = [];
     if (aprobado(estado2)) {
         const declaradas = decisiones.dependencias ?? [];
+        const descartes = decisiones.descartadas ?? [];
         const detectadas = buscarDependenciasTransitivas(modelo);
         const sinCubrir = detectadas.filter(d =>
-            !declaradas.some(x => x.tabla === d.tabla && x.determinante === d.determinante));
+            !declaradas.some(x => x.tabla === d.tabla && x.determinante === d.determinante) &&
+            !estaDescartada(descartes, '3FN', d.tabla, [d.determinante]));
         if (sinCubrir.length) {
             estado3 = 'revisar';
-            detalles3 = sinCubrir.map(d =>
-                `${d.tabla}: ${d.determinante} → ${d.dependientes.join(', ')} (detectada en los datos). Declárala para separarla o descártala.`);
+            pendientes3 = sinCubrir.map(d => ({ fase: '3FN' as const, tabla: d.tabla, determinante: [d.determinante], dependientes: d.dependientes }));
+            detalles3 = pendientes3.map(p =>
+                `${p.tabla}: ${p.determinante.join(', ')} → ${p.dependientes.join(', ')} (detectada en los datos). Declárala para separarla o descártala.`);
         } else {
             try {
                 detalles3 = aplicarTerceraFN(modelo, declaradas);
@@ -938,6 +1069,7 @@ function ejecutarPipeline(original: Modelo, avisos: string[], decisiones: Decisi
         titulo: 'Tercera forma normal (3FN)',
         estado: estado3,
         detalles: detalles3,
+        pendientes: pendientes3,
         ...vistaDeTablas(modelo),
         mensaje: mensajesPaso({
             cumple: 'Ya cumple 3FN: no hay dependencias transitivas declaradas ni detectadas.',
